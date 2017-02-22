@@ -2,9 +2,11 @@ var secureServer = !!process.env.HTTPS;
 var serverPort = +process.env.PORT || +process.argv[2] || (secureServer? 443: 80);
 var bindAddress = process.env.BIND_ADDRESS || process.argv[3] || '::';
 var infoSite = process.env.INFOSITE || "http://shields.io";
+var githubApiUrl = process.env.GITHUB_URL || 'https://api.github.com';
+var path = require('path');
 var Camp = require('camp');
 var camp = Camp.start({
-  documentRoot: __dirname,
+  documentRoot: path.join(__dirname, 'public'),
   port: serverPort,
   hostname: bindAddress,
   secure: secureServer
@@ -18,13 +20,21 @@ var LruCache = require('./lru-cache.js');
 var badge = require('./badge.js');
 var svg2img = require('./svg-to-img.js');
 var loadLogos = require('./load-logos.js');
+var githubAuth = require('./lib/github-auth.js');
 var querystring = require('querystring');
+var xml2js = require('xml2js');
 var serverSecrets;
 try {
   // Everything that cannot be checked in but is useful server-side
   // is stored in this JSON data.
-  serverSecrets = require('./secret.json');
-} catch(e) { console.error('No secret data (secret.json, see server.js):', e); }
+  serverSecrets = require('./private/secret.json');
+} catch(e) {
+  console.error('No secret data (private/secret.json, see server.js):', e);
+}
+if (serverSecrets && serverSecrets.gh_client_id) {
+  githubAuth.setRoutes(camp);
+}
+
 var semver = require('semver');
 var serverStartTime = new Date((new Date()).toGMTString());
 
@@ -170,8 +180,12 @@ vendorDomain.on('error', function(err) {
 
 function cache(f) {
   return function getRequest(data, match, end, ask) {
-    // Cache management - no cache, so it won't be cached by GitHub's CDN.
-    ask.res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    if (data.maxAge !== undefined && /^[0-9]+$/.test(data.maxAge)) {
+      ask.res.setHeader('Cache-Control', 'max-age=' + data.maxAge);
+    } else {
+      // Cache management - no cache, so it won't be cached by GitHub's CDN.
+      ask.res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    }
     var reqTime = new Date();
     var date = (reqTime).toGMTString();
     ask.res.setHeader('Expires', date);  // Proxies, GitHub, see #221.
@@ -185,7 +199,8 @@ function cache(f) {
 
     var cacheIndex = match[0] + '?label=' + data.label + '&style=' + data.style
       + '&logo=' + data.logo + '&logoWidth=' + data.logoWidth
-      + '&link=' + data.link;
+      + '&link=' + JSON.stringify(data.link) + '&colorA=' + data.colorA
+      + '&colorB=' + data.colorB;
     // Should we return the data right away?
     var cached = requestCache.get(cacheIndex);
     var cachedVersionSent = false;
@@ -210,6 +225,7 @@ function cache(f) {
         badge(cached.badgeData, makeSend(cached.format, ask.res, end));
         return;
       }
+      ask.res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
       var badgeData = getBadgeData('vendor', data);
       badgeData.text[1] = 'unresponsive';
       var extension;
@@ -342,6 +358,62 @@ cache(function (data, match, sendBadge, request) {
   });
 }));
 
+// JIRA agile sprint completion integration
+camp.route(/^\/jira\/sprint\/(http(?:s)?)\/(.+)\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
+cache(function (data, match, sendBadge, request) {
+  var protocol  = match[1]; // eg, https
+  var host      = match[2]; // eg, jira.spring.io
+  var sprintId  = match[3]; // eg, 94
+  var format    = match[4]; // eg, png
+
+  var options = {
+    method: 'GET',
+    json: true,
+    uri: protocol + '://' + host + '/rest/api/2/search?jql=sprint='+sprintId+'%20AND%20type%20IN%20(Bug,Improvement,Story,"Technical%20task")&fields=resolution&maxResults=500'
+  };
+  if (serverSecrets && serverSecrets.jira_username) {
+    options.auth = {
+      user: serverSecrets.jira_username,
+      pass: serverSecrets.jira_password
+    };
+  }
+
+  var badgeData = getBadgeData('completion', data);
+  request(options, function (err, res, json) {
+    if (err != null) {
+      badgeData.text[1] = 'inaccessible';
+      sendBadge(format, badgeData);
+      return;
+    }
+    try {
+      if (json && json.total >= 0) {
+        var issuesDone = json.issues.filter(function (el) {
+          if (el.fields.resolution != null) {
+            return el.fields.resolution.name !== "Unresolved";
+          }
+        }).length;
+        badgeData.text[1] = Math.round(issuesDone * 100 / json.total) + "%";
+        switch(issuesDone) {
+          case 0:
+            badgeData.colorscheme = 'red';
+            break;
+          case json.total:
+            badgeData.colorscheme = 'brightgreen';
+            break;
+          default:
+            badgeData.colorscheme = 'orange';
+        }
+      } else {
+        badgeData.text[1] = 'invalid';
+      }
+      sendBadge(format, badgeData);
+    } catch (e) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
+    }
+  });
+}));
+
 // Travis integration
 camp.route(/^\/travis(-ci)?\/([^\/]+\/[^\/]+)(?:\/(.+))?\.(svg|png|gif|jpg|json)$/,
 cache(function(data, match, sendBadge, request) {
@@ -384,37 +456,141 @@ cache(function(data, match, sendBadge, request) {
   });
 }));
 
+// NetflixOSS metadata integration
+camp.route(/^\/osslifecycle?\/([^\/]+\/[^\/]+)(?:\/(.+))?\.(svg|png|gif|jpg|json)$/,
+  cache(function(data, match, sendBadge, request) {
+    var orgOrUserAndRepo = match[1];
+    var branch = match[2];
+    var format = match[3];
+    var url = 'https://raw.githubusercontent.com/' + orgOrUserAndRepo;
+    if (branch != null) {
+      url += "/" + branch + "/OSSMETADATA"
+    }
+    else {
+      url += "/master/OSSMETADATA";
+    }
+    var options = {
+      method: 'GET',
+      uri: url
+    };
+    var badgeData = getBadgeData('OSS Lifecycle', data);
+    request(options, function(err, res, body) {
+      if (err != null) {
+        console.error('NetflixOSS error: ' + err.stack);
+        if (res) { console.error(''+res); }
+        badgeData.text[1] = 'invalid';
+        sendBadge(format, badgeData);
+        return;
+      }
+      try {
+        var matchStatus = body.match(/osslifecycle\=([a-z]+)/im);
+        if (matchStatus === null) {
+          badgeData.text[1] = 'inaccessible';
+          sendBadge(format, badgeData);
+          return;
+        } else {
+          badgeData.text[1] = matchStatus[1];
+          sendBadge(format, badgeData);
+          return;
+        }
+      } catch(e) {
+        console.log(e);
+        badgeData.text[1] = 'inaccessible';
+        sendBadge(format, badgeData);
+      }
+    });
+}));
+
 // Shippable integration
-camp.route(/^\/shippable?\/([^\/]+)(?:\/(.+))?\.(svg|png|gif|jpg|json)$/,
-cache(function(data, match, sendBadge, request) {
+camp.route(/^\/shippable\/([^\/]+)(?:\/(.+))?\.(svg|png|gif|jpg|json)$/,
+cache(function (data, match, sendBadge, request) {
+  var defaultOpts = {
+    colorA: '#555555',
+    successLabel: 'passing',
+    successColor: '#44CC11',
+    failLabel: 'failing',
+    failColor: '#DC5F59',
+    cancelledLabel: 'cancelled',
+    cancelledColor: '#6BAFBD',
+    unstableLabel: 'unstable',
+    unstableColor: '#CEA61B',
+    pendingLabel: 'pending',
+    pendingColor: '#5183A0',
+    skippedLabel: 'skipped',
+    skippedColor: '#F8A97D',
+    noBuildLabel: 'none',
+    noBuildColor: '#A1ABAB',
+    inaccessibleLabel: 'inaccessible',
+    inaccessibleColor: '#A1ABAB'
+  };
+
+  var badgeData = getBadgeData('build', data);
+  delete badgeData.colorscheme;
+
+  // overwrite the default options if present in query parameters
+  Object.keys(defaultOpts).forEach(
+    function (key) {
+      defaultOpts[key] = data[key] || defaultOpts[key];
+    }
+  );
+
+  badgeData.colorA = defaultOpts.colorA;
+  badgeData.colorB = defaultOpts.noBuildColor;
+
   var project = match[1];  // eg, 54d119db5ab6cc13528ab183
   var branch = match[2];
   var format = match[3];
   var url = 'https://api.shippable.com/projects/' + project + '/badge';
+
   if (branch != null) {
-    url += '?branchName=' + branch;
+    url += '?branch=' + branch;
   }
-  var badgeData = getBadgeData('build', data);
-  fetchFromSvg(request, url, function(err, res) {
+
+  fetchFromSvg(request, url, function (err, res) {
     if (err != null) {
-      badgeData.text[1] = 'inaccessible';
+      badgeData.text[1] = defaultOpts.inaccessibleLabel;
       sendBadge(format, badgeData);
       return;
     }
+
     try {
-      badgeData.text[1] = res;
-      if (res === 'shippable') {
-        badgeData.colorscheme = 'brightgreen';
-        badgeData.text[1] = 'passing';
-      } else if (res === 'unshippable') {
-        badgeData.colorscheme = 'red';
-      } else {
-        badgeData.text[1] = res;
+      switch (res) {
+        case 'none':
+          badgeData.text[1] = defaultOpts.noBuildLabel;
+          badgeData.colorB = defaultOpts.noBuildColor;
+          break;
+        case 'shippable':
+          badgeData.text[1] = defaultOpts.successLabel;
+          badgeData.colorB = defaultOpts.successColor;
+          break;
+        case 'failed':
+          badgeData.text[1] = defaultOpts.failLabel;
+          badgeData.colorB = defaultOpts.failColor;
+          break;
+        case 'cancelled':
+          badgeData.text[1] = defaultOpts.cancelledLabel;
+          badgeData.colorB = defaultOpts.cancelledColor;
+          break;
+        case 'pending':
+          badgeData.text[1] = defaultOpts.pendingLabel;
+          badgeData.colorB = defaultOpts.pendingColor;
+          break;
+        case 'skipped':
+          badgeData.text[1] = defaultOpts.skippedLabel;
+          badgeData.colorB = defaultOpts.skippedColor;
+          break;
+        case 'unstable':
+          badgeData.text[1] = defaultOpts.unstableLabel;
+          badgeData.colorB = defaultOpts.unstableColor;
+          break;
+        default:
+          badgeData.text[1] = 'invalid';
+          badgeData.colorB = defaultOpts.noBuildColor;
       }
       sendBadge(format, badgeData);
-
-    } catch(e) {
+    } catch (e) {
       badgeData.text[1] = 'invalid';
+      badgeData.colorB = defaultOpts.noBuildColor;
       sendBadge(format, badgeData);
     }
   });
@@ -558,7 +734,7 @@ cache(function (data, match, sendBadge, request) {
   request(apiUrl, { headers: { 'Accept': 'application/json' } }, function (err, res, buffer) {
     if (err != null) {
       badgeData.text[1] = 'inaccessible';
-      sendBadge(badgeData, format);
+      sendBadge(format, badgeData);
     }
     try {
       var data = JSON.parse(buffer);
@@ -876,8 +1052,8 @@ cache(function(data, match, sendBadge, request) {
         return;
       }
       try {
-        badgeData = JSON.parse(buffer);
-        sendBadge(format, badgeData);
+        var data = JSON.parse(buffer);
+        sendBadge(format, data);
       } catch(e) {
         badgeData.text[1] = 'invalid';
         sendBadge(format, badgeData);
@@ -1338,6 +1514,32 @@ cache(function(data, match, sendBadge, request) {
   });
 }));
 
+// CDNJS version integration
+camp.route(/^\/cdnjs\/v\/(.*)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var library = encodeURIComponent(match[1]);  // eg, "express" or "@user/express"
+  var format = match[2];
+  var apiUrl = 'https://api.cdnjs.com/libraries/' + library + '?fields=version';
+  var badgeData = getBadgeData('cdnjs', data);
+  request(apiUrl, function(err, res, buffer) {
+    if (err != null) {
+      badgeData.text[1] = 'inaccessible';
+      sendBadge(format, badgeData);
+      return;
+    }
+    try {
+      var version = JSON.parse(buffer).version || 0;
+      var vdata = versionColor(version);
+      badgeData.text[1] = vdata.version;
+      badgeData.colorscheme = vdata.color;
+      sendBadge(format, badgeData);
+    } catch(e) {
+      badgeData.text[1] = 'not found';
+      sendBadge(format, badgeData);
+    }
+  });
+}));
+
 // npm download integration.
 camp.route(/^\/npm\/dm\/(.*)\.(svg|png|gif|jpg|json)$/,
 cache(function(data, match, sendBadge, request) {
@@ -1352,25 +1554,24 @@ cache(function(data, match, sendBadge, request) {
       return;
     }
     try {
-      var monthly = JSON.parse(buffer).downloads;
+      var monthly = JSON.parse(buffer).downloads || 0;
+      badgeData.text[1] = metric(monthly) + '/month';
+      if (monthly === 0) {
+        badgeData.colorscheme = 'red';
+      } else if (monthly < 10) {
+        badgeData.colorscheme = 'yellow';
+      } else if (monthly < 100) {
+        badgeData.colorscheme = 'yellowgreen';
+      } else if (monthly < 1000) {
+        badgeData.colorscheme = 'green';
+      } else {
+        badgeData.colorscheme = 'brightgreen';
+      }
+      sendBadge(format, badgeData);
     } catch(e) {
       badgeData.text[1] = 'invalid';
       sendBadge(format, badgeData);
-      return;
     }
-    badgeData.text[1] = metric(monthly) + '/month';
-    if (monthly === 0) {
-      badgeData.colorscheme = 'red';
-    } else if (monthly < 10) {
-      badgeData.colorscheme = 'yellow';
-    } else if (monthly < 100) {
-      badgeData.colorscheme = 'yellowgreen';
-    } else if (monthly < 1000) {
-      badgeData.colorscheme = 'green';
-    } else {
-      badgeData.colorscheme = 'brightgreen';
-    }
-    sendBadge(format, badgeData);
   });
 }));
 
@@ -1391,7 +1592,7 @@ cache(function (data, match, sendBadge, request) {
     try {
       var totalDownloads = 0;
 
-      var downloads = JSON.parse(buffer).downloads;
+      var downloads = JSON.parse(buffer).downloads || 0;
       for (var index = 0; index < downloads.length; index++) {
         totalDownloads = totalDownloads + downloads[index].downloads;
       }
@@ -1698,7 +1899,7 @@ cache(function(data, match, sendBadge, request) {
   request(url, function(err, res, buffer) {
     if (err != null) {
       badgeData.text[1] = 'inaccessible';
-      sendBadge(badgeData, format);
+      sendBadge(format, badgeData);
       return;
     }
     try {
@@ -1733,7 +1934,7 @@ cache(function(data, match, sendBadge, request) {
   request(url, function(err, res, buffer) {
     if (err != null) {
       badgeData.text[1] = 'inaccessible';
-      sendBadge(badgeData, format);
+      sendBadge(format, badgeData);
       return;
     }
     try {
@@ -2149,6 +2350,46 @@ cache(function(data, match, sendBadge, request) {
   });
 }));
 
+// Code Climate issues integration
+camp.route(/^\/codeclimate\/issues\/(.+)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var userRepo = match[1];  // eg, `github/me-and/mdf`.
+  var format = match[2];
+  var options = 'https://codeclimate.com/' + userRepo + '/badges/issue_count.svg'
+  var badgeData = getBadgeData('issues', data);
+  request(options, function(err, res, buffer) {
+    if (err != null) {
+      badgeData.text[1] = 'inaccessible';
+      sendBadge(format, badgeData);
+      return;
+    }
+    try {
+      var count = buffer.match(/>([0-9]+) issues?/)[1];
+      if (!count) {
+        badgeData.text[1] = 'malformed';
+        sendBadge(format, badgeData);
+        return;
+      }
+      badgeData.text[1] = count;
+      if (count == 0) {
+        badgeData.colorscheme = 'brightgreen';
+      } else if (count < 5) {
+        badgeData.colorscheme = 'green';
+      } else if (count < 10) {
+        badgeData.colorscheme = 'yellowgreen';
+      } else if (count < 20) {
+        badgeData.colorscheme = 'yellow';
+      } else {
+        badgeData.colorscheme = 'red';
+      }
+      sendBadge(format, badgeData);
+    } catch(e) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
+    }
+  });
+}));
+
 // Code Climate integration
 camp.route(/^\/codeclimate\/(.+)\.(svg|png|gif|jpg|json)$/,
 cache(function(data, match, sendBadge, request) {
@@ -2395,13 +2636,13 @@ cache(function(data, match, sendBadge, request) {
     try {
       var nameMatch = buffer.match(/(devD|d)ependencies/)[0];
       var statusMatch = buffer.match(/'14'>(.+)<\/text>\s*<\/g>/)[1];
-      badgeData.text[0] = nameMatch;
+      badgeData.text[0] = data.label || nameMatch;
       badgeData.text[1] = statusMatch;
       if (statusMatch === 'up-to-date') {
         badgeData.colorscheme = 'brightgreen';
       } else if (statusMatch === 'out-of-date') {
         badgeData.colorscheme = 'yellow';
-      } else if (statusMatch === 'up-to-date') {
+      } else if (statusMatch === 'update!') {
         badgeData.colorscheme = 'red';
       } else if (statusMatch === 'none') {
         badgeData.colorscheme = 'brightgreen';
@@ -2451,7 +2692,7 @@ cache(function(data, match, sendBadge, request) {
 }));
 
 // Codacy integration
-camp.route(/^\/codacy?\/([^\/]+)(?:\/(.+))?\.(svg|png|gif|jpg|json)$/,
+camp.route(/^\/codacy\/(?:grade\/)?(?!coverage\/)([^\/]+)(?:\/(.+))?\.(svg|png|gif|jpg|json)$/,
 cache(function(data, match, sendBadge, request) {
   var projectId = match[1];  // eg. e27821fb6289410b8f58338c7e0bc686
   var branch = match[2];
@@ -2462,7 +2703,7 @@ cache(function(data, match, sendBadge, request) {
     queryParams.branch = branch;
   }
   var query = querystring.stringify(queryParams);
-  var url = 'https://www.codacy.com/project/badge/' + projectId + '?' + query;
+  var url = 'https://www.codacy.com/project/badge/grade/' + projectId + '?' + query;
   var badgeData = getBadgeData('code quality', data);
   fetchFromSvg(request, url, function(err, res) {
     if (err != null) {
@@ -2490,6 +2731,37 @@ cache(function(data, match, sendBadge, request) {
       } else {
         badgeData.colorscheme = 'red';
       }
+      sendBadge(format, badgeData);
+
+    } catch(e) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
+    }
+  });
+}));
+
+camp.route(/^\/codacy\/coverage\/(?!grade\/)([^\/]+)(?:\/(.+))?\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var projectId = match[1];  // eg. e27821fb6289410b8f58338c7e0bc686
+  var branch = match[2];
+  var format = match[3];
+
+  queryParams = {};
+  if (branch) {
+    queryParams.branch = branch;
+  }
+  var query = querystring.stringify(queryParams);
+  var url = 'https://www.codacy.com/project/badge/coverage/' + projectId + '?' + query;
+  var badgeData = getBadgeData('coverage', data);
+  fetchFromSvg(request, url, function(err, res) {
+    if (err != null) {
+      badgeData.text[1] = 'inaccessible';
+      sendBadge(format, badgeData);
+      return;
+    }
+    try {
+      badgeData.text[1] = res;
+      badgeData.colorscheme = coveragePercentageColor(parseInt(res));
       sendBadge(format, badgeData);
 
     } catch(e) {
@@ -2617,6 +2889,7 @@ cache(function(data, match, sendBadge, request) {
   });
 }));
 
+// CocoaPods metrics
 camp.route(/^\/cocoapods\/metrics\/doc-percent\/(.*)\.(svg|png|gif|jpg|json)$/,
 cache(function(data, match, sendBadge, request) {
   var spec = match[1];  // eg, AFNetworking
@@ -2643,35 +2916,100 @@ cache(function(data, match, sendBadge, request) {
   });
 }));
 
-// GitHub tag integration.
-camp.route(/^\/github\/tag\/([^\/]+)\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
+// Cocoapods Downloads integration.
+camp.route(/^\/cocoapods\/(dm|dw|dt)\/(.*)\.(svg|png|gif|jpg|json)$/,
 cache(function(data, match, sendBadge, request) {
-  var user = match[1];  // eg, strongloop/express
-  var repo = match[2];
+  var info = match[1]; // One of these: "dm", "dw", "dt"
+  var spec = match[2];  // eg, AFNetworking
   var format = match[3];
-  var apiUrl = 'https://api.github.com/repos/' + user + '/' + repo + '/tags';
-  // Using our OAuth App secret grants us 5000 req/hour
-  // instead of the standard 60 req/hour.
-  if (serverSecrets) {
-    apiUrl += '?client_id=' + serverSecrets.gh_client_id
-      + '&client_secret=' + serverSecrets.gh_client_secret;
-  }
-  var badgeData = getBadgeData('tag', data);
-  if (badgeData.template === 'social') {
-    badgeData.logo = badgeData.logo || logos.github;
-  }
-  // A special User-Agent is required:
-  // http://developer.github.com/v3/#user-agent-required
-  request(apiUrl, { headers: githubHeaders }, function(err, res, buffer) {
+  var apiUrl = 'http://metrics.cocoapods.org/api/v1/pods/' + spec;
+  var badgeData = getBadgeData('downloads', data);
+  request(apiUrl, function(err, res, buffer) {
     if (err != null) {
       badgeData.text[1] = 'inaccessible';
       sendBadge(format, badgeData);
       return;
     }
     try {
-      if ((+res.headers['x-ratelimit-remaining']) === 0) {
-        return;  // Hope for the best in the cache.
+      var data = JSON.parse(buffer);
+      var downloads = 0;
+      switch (info.charAt(1)) {
+        case 'm':
+          downloads = data.stats.download_month;
+          badgeData.text[1] = metric(downloads) + '/month';
+          break;
+        case 'w':
+          downloads = data.stats.download_week;
+          badgeData.text[1] = metric(downloads) + '/week';
+          break;
+        case 't':
+          downloads = data.stats.download_total;
+          badgeData.text[1] = metric(downloads);
+          break;
       }
+      badgeData.colorscheme = downloadCountColor(downloads);
+      sendBadge(format, badgeData);
+    } catch(e) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
+    }
+  });
+}));
+
+// CocoaPods Apps Integration
+camp.route(/^\/cocoapods\/(aw|at)\/(.*)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var info = match[1]; // One of these: "aw", "at"
+  var spec = match[2];  // eg, AFNetworking
+  var format = match[3];
+  var apiUrl = 'http://metrics.cocoapods.org/api/v1/pods/' + spec;
+  var badgeData = getBadgeData('apps', data);
+  request(apiUrl, function(err, res, buffer) {
+    if (err != null) {
+      badgeData.text[1] = 'inaccessible';
+      sendBadge(format, badgeData);
+      return;
+    }
+    try {
+      var data = JSON.parse(buffer);
+      var apps = 0;
+      switch (info.charAt(1)) {
+        case 'w':
+          apps = data.stats.app_week;
+          badgeData.text[1] = metric(apps) + '/week';
+          break;
+        case 't':
+          apps = data.stats.app_total;
+          badgeData.text[1] = metric(apps);
+          break;
+      }
+      badgeData.colorscheme = downloadCountColor(apps);
+      sendBadge(format, badgeData);
+    } catch(e) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
+    }
+  });
+}));
+
+// GitHub tag integration.
+camp.route(/^\/github\/tag\/([^\/]+)\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var user = match[1];  // eg, strongloop/express
+  var repo = match[2];
+  var format = match[3];
+  var apiUrl = githubApiUrl + '/repos/' + user + '/' + repo + '/tags';
+  var badgeData = getBadgeData('tag', data);
+  if (badgeData.template === 'social') {
+    badgeData.logo = badgeData.logo || logos.github;
+  }
+  githubAuth.request(request, apiUrl, {}, function(err, res, buffer) {
+    if (err != null) {
+      badgeData.text[1] = 'inaccessible';
+      sendBadge(format, badgeData);
+      return;
+    }
+    try {
       var data = JSON.parse(buffer);
       var versions = data.map(function(e) { return e.name; });
       var tag = latestVersion(versions);
@@ -2686,35 +3024,60 @@ cache(function(data, match, sendBadge, request) {
   });
 }));
 
-// GitHub release integration.
-camp.route(/^\/github\/release\/([^\/]+)\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
+// GitHub contributors integration.
+camp.route(/^\/github\/contributors(-anon)?\/([^\/]+)\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
 cache(function(data, match, sendBadge, request) {
-  var user = match[1];  // eg, qubyte/rubidium
-  var repo = match[2];
-  var format = match[3];
-  var apiUrl = 'https://api.github.com/repos/' + user + '/' + repo + '/releases/latest';
-  // Using our OAuth App secret grants us 5000 req/hour
-  // instead of the standard 60 req/hour.
-  if (serverSecrets) {
-    apiUrl += '?client_id=' + serverSecrets.gh_client_id
-      + '&client_secret=' + serverSecrets.gh_client_secret;
-  }
-  var badgeData = getBadgeData('release', data);
+  var isAnon = match[1];
+  var user = match[2];  // eg, qubyte/rubidium
+  var repo = match[3];
+  var format = match[4];
+  var apiUrl = 'https://api.github.com/repos/' + user + '/' + repo + '/contributors?page=1&per_page=1&anon=' + (!!isAnon);
+  var badgeData = getBadgeData('contributors', data);
   if (badgeData.template === 'social') {
     badgeData.logo = badgeData.logo || logos.github;
   }
-  // A special User-Agent is required:
-  // http://developer.github.com/v3/#user-agent-required
-  request(apiUrl, { headers: githubHeaders }, function(err, res, buffer) {
+  githubAuth.request(request, apiUrl, {}, function(err, res, buffer) {
     if (err != null) {
       badgeData.text[1] = 'inaccessible';
       sendBadge(format, badgeData);
       return;
     }
     try {
-      if ((+res.headers['x-ratelimit-remaining']) === 0) {
-        return;  // Hope for the best in the cache.
+      var contributors;
+
+      if (res.headers['link'] && res.headers['link'].indexOf('rel="last"') !== -1) {
+        contributors = res.headers['link'].match(/[?&]page=(\d+)[^>]+>; rel="last"/)[1];
+      } else {
+        contributors = JSON.parse(buffer).length;
       }
+
+      badgeData.text[1] = metric(+contributors);
+      badgeData.colorscheme = 'blue';
+    } catch(e) {
+      badgeData.text[1] = 'inaccessible';
+    }
+    sendBadge(format, badgeData);
+  });
+}));
+
+// GitHub release integration.
+camp.route(/^\/github\/release\/([^\/]+)\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var user = match[1];  // eg, qubyte/rubidium
+  var repo = match[2];
+  var format = match[3];
+  var apiUrl = githubApiUrl + '/repos/' + user + '/' + repo + '/releases/latest';
+  var badgeData = getBadgeData('release', data);
+  if (badgeData.template === 'social') {
+    badgeData.logo = badgeData.logo || logos.github;
+  }
+  githubAuth.request(request, apiUrl, {}, function(err, res, buffer) {
+    if (err != null) {
+      badgeData.text[1] = 'inaccessible';
+      sendBadge(format, badgeData);
+      return;
+    }
+    try {
       var data = JSON.parse(buffer);
       var version = data.tag_name;
       var prerelease = data.prerelease;
@@ -2736,31 +3099,20 @@ cache(function(data, match, sendBadge, request) {
   var repo = match[2];  // eg, subtitleedit
   var version = match[3];  // eg, 3.4.7
   var format = match[4];
-  var apiUrl = 'https://api.github.com/repos/' + user + '/' + repo + '/compare/' + version + '...master';
-  // Using our OAuth App secret grants us 5000 req/hour
-  // instead of the standard 60 req/hour.
-  if (serverSecrets) {
-    apiUrl += '?client_id=' + serverSecrets.gh_client_id
-      + '&client_secret=' + serverSecrets.gh_client_secret;
-  }
+  var apiUrl = githubApiUrl + '/repos/' + user + '/' + repo + '/compare/' + version + '...master';
   var badgeData = getBadgeData('commits since ' + version, data);
   if (badgeData.template === 'social') {
     badgeData.logo = badgeData.logo || logos.github;
   }
-  // A special User-Agent is required:
-  // http://developer.github.com/v3/#user-agent-required
-  request(apiUrl, { headers: githubHeaders }, function(err, res, buffer) {
+  githubAuth.request(request, apiUrl, {}, function(err, res, buffer) {
     if (err != null) {
       badgeData.text[1] = 'inaccessible';
       sendBadge(format, badgeData);
       return;
     }
     try {
-      if ((+res.headers['x-ratelimit-remaining']) === 0) {
-        return;  // Hope for the best in the cache.
-      }
       var data = JSON.parse(buffer);
-      badgeData.text[1] = data.ahead_by;
+      badgeData.text[1] = metric(data.ahead_by);
       badgeData.colorscheme = 'blue';
       sendBadge(format, badgeData);
     } catch(e) {
@@ -2776,7 +3128,7 @@ cache(function(data, match, sendBadge, request) {
   var user = match[1];  // eg, qubyte/rubidium
   var repo = match[2];
 
-  var tag = match[3]; //null for all releases
+  var tag = match[3];  // eg, v0.190.0, latest, null if querying all releases
   var asset_name = match[4].toLowerCase(); // eg. total, atom-amd64.deb, atom.x86_64.rpm
   var format = match[5];
 
@@ -2787,32 +3139,21 @@ cache(function(data, match, sendBadge, request) {
     total = false;
   }
 
-  var apiUrl = 'https://api.github.com/repos/' + user + '/' + repo + '/releases';
+  var apiUrl = githubApiUrl + '/repos/' + user + '/' + repo + '/releases';
   if (!total) {
     var release_path = tag !== 'latest' ? 'tags/' + tag : 'latest';
     apiUrl = apiUrl + '/' + release_path;
-  }
-  // Using our OAuth App secret grants us 5000 req/hour
-  // instead of the standard 60 req/hour.
-  if (serverSecrets) {
-    apiUrl += '?client_id=' + serverSecrets.gh_client_id
-      + '&client_secret=' + serverSecrets.gh_client_secret;
   }
   var badgeData = getBadgeData('downloads', data);
   if (badgeData.template === 'social') {
     badgeData.logo = badgeData.logo || logos.github;
   }
-  // A special User-Agent is required:
-  // http://developer.github.com/v3/#user-agent-required
-  request(apiUrl, { headers: githubHeaders }, function(err, res, buffer) {
+  githubAuth.request(request, apiUrl, {}, function(err, res, buffer) {
     if (err != null) {
       badgeData.text[1] = 'inaccessible';
       return sendBadge(format, badgeData);
     }
     try {
-      if ((+res.headers['x-ratelimit-remaining']) === 0) {
-        return;  // Hope for the best in the cache.
-      }
       var data = JSON.parse(buffer);
       var downloads = 0;
 
@@ -2853,39 +3194,63 @@ cache(function(data, match, sendBadge, request) {
 }));
 
 // GitHub issues integration.
-camp.route(/^\/github\/issues(-raw)?\/([^\/]+)\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
+camp.route(/^\/github\/issues(-pr)?(-closed)?(-raw)?\/([^\/]+)\/([^\/]+)\/?([^\/]+)?\.(svg|png|gif|jpg|json)$/,
 cache(function(data, match, sendBadge, request) {
-  var isRaw = !!match[1];
-  var user = match[2];  // eg, qubyte/rubidium
-  var repo = match[3];
-  var format = match[4];
-  var apiUrl = 'https://api.github.com/repos/' + user + '/' + repo;
-  // Using our OAuth App secret grants us 5000 req/hour
-  // instead of the standard 60 req/hour.
-  if (serverSecrets) {
-    apiUrl += '?client_id=' + serverSecrets.gh_client_id
-      + '&client_secret=' + serverSecrets.gh_client_secret;
+  var isPR = !!match[1];
+  var isClosed = !!match[2];
+  var isRaw = !!match[3];
+  var user = match[4];  // eg, badges
+  var repo = match[5];  // eg, shields
+  var ghLabel = match[6];  // eg, website
+  var format = match[7];
+  var apiUrl = githubApiUrl;
+  var query = {};
+  var issuesApi = false;  // Are we using the issues API instead of the repo one?
+  if (isPR) {
+    apiUrl += '/search/issues';
+    query.q = 'is:pr is:' + (isClosed? 'closed': 'open') +
+      ' repo:' + user + '/' + repo;
+  } else {
+    apiUrl += '/repos/' + user + '/' + repo;
+    if (isClosed || ghLabel !== undefined) {
+      apiUrl += '/issues';
+      if (isClosed) { query.state = 'closed'; }
+      if (ghLabel !== undefined) { query.labels = ghLabel; }
+      issuesApi = true;
+    }
   }
-  var badgeData = getBadgeData('issues', data);
+
+  var closedText = isClosed? 'closed ': '';
+  var targetText = isPR? 'pull requests': 'issues';
+  var badgeData = getBadgeData(closedText + targetText, data);
   if (badgeData.template === 'social') {
     badgeData.logo = badgeData.logo || logos.github;
   }
-  // A special User-Agent is required:
-  // http://developer.github.com/v3/#user-agent-required
-  request(apiUrl, { headers: githubHeaders }, function(err, res, buffer) {
+  githubAuth.request(request, apiUrl, query, function(err, res, buffer) {
     if (err != null) {
       badgeData.text[1] = 'inaccessible';
       sendBadge(format, badgeData);
       return;
     }
     try {
-      if ((+res.headers['x-ratelimit-remaining']) === 0) {
-        return;  // Hope for the best in the cache.
-      }
       var data = JSON.parse(buffer);
-      var issues = data.open_issues_count;
-      badgeData.text[1] = issues + (isRaw? '': ' open');
-      badgeData.colorscheme = issues ? 'yellow' : 'brightgreen';
+      var modifier = '';
+      if (isPR) {
+        issues = data.total_count;
+      } else {
+        if (issuesApi) {
+          var issues = data.length;
+          if (res.headers['link'] &&
+              res.headers['link'].indexOf('rel="last"') >= 0) {
+            modifier = '+';
+          }
+        } else {
+          var issues = data.open_issues_count;
+        }
+      }
+      var rightText = isRaw? '': (isClosed? ' closed': ' open');
+      badgeData.text[1] = metric(issues) + modifier + rightText;
+      badgeData.colorscheme = (issues > 0)? 'yellow': 'brightgreen';
       sendBadge(format, badgeData);
     } catch(e) {
       badgeData.text[1] = 'invalid';
@@ -2900,13 +3265,7 @@ cache(function(data, match, sendBadge, request) {
   var user = match[1];  // eg, qubyte/rubidium
   var repo = match[2];
   var format = match[3];
-  var apiUrl = 'https://api.github.com/repos/' + user + '/' + repo;
-  // Using our OAuth App secret grants us 5000 req/hour
-  // instead of the standard 60 req/hour.
-  if (serverSecrets) {
-    apiUrl += '?client_id=' + serverSecrets.gh_client_id
-      + '&client_secret=' + serverSecrets.gh_client_secret;
-  }
+  var apiUrl = githubApiUrl + '/repos/' + user + '/' + repo;
   var badgeData = getBadgeData('forks', data);
   if (badgeData.template === 'social') {
     badgeData.logo = badgeData.logo || logos.github;
@@ -2915,18 +3274,13 @@ cache(function(data, match, sendBadge, request) {
       'https://github.com/' + user + '/' + repo + '/network',
      ];
   }
-  // A special User-Agent is required:
-  // http://developer.github.com/v3/#user-agent-required
-  request(apiUrl, { headers: githubHeaders }, function(err, res, buffer) {
+  githubAuth.request(request, apiUrl, {}, function(err, res, buffer) {
     if (err != null) {
       badgeData.text[1] = 'inaccessible';
       sendBadge(format, badgeData);
       return;
     }
     try {
-      if ((+res.headers['x-ratelimit-remaining']) === 0) {
-        return;  // Hope for the best in the cache.
-      }
       var data = JSON.parse(buffer);
       var forks = data.forks_count;
       badgeData.text[1] = forks;
@@ -2946,13 +3300,7 @@ cache(function(data, match, sendBadge, request) {
   var user = match[1];  // eg, qubyte/rubidium
   var repo = match[2];
   var format = match[3];
-  var apiUrl = 'https://api.github.com/repos/' + user + '/' + repo;
-  // Using our OAuth App secret grants us 5000 req/hour
-  // instead of the standard 60 req/hour.
-  if (serverSecrets) {
-    apiUrl += '?client_id=' + serverSecrets.gh_client_id
-      + '&client_secret=' + serverSecrets.gh_client_secret;
-  }
+  var apiUrl = githubApiUrl + '/repos/' + user + '/' + repo;
   var badgeData = getBadgeData('stars', data);
   if (badgeData.template === 'social') {
     badgeData.logo = badgeData.logo || logos.github;
@@ -2961,19 +3309,14 @@ cache(function(data, match, sendBadge, request) {
       'https://github.com/' + user + '/' + repo + '/stargazers',
      ];
   }
-  // A special User-Agent is required:
-  // http://developer.github.com/v3/#user-agent-required
-  request(apiUrl, { headers: githubHeaders }, function(err, res, buffer) {
+  githubAuth.request(request, apiUrl, {}, function(err, res, buffer) {
     if (err != null) {
       badgeData.text[1] = 'inaccessible';
       sendBadge(format, badgeData);
       return;
     }
     try {
-      if ((+res.headers['x-ratelimit-remaining']) === 0) {
-        return;  // Hope for the best in the cache.
-      }
-      badgeData.text[1] = JSON.parse(buffer).stargazers_count;
+      badgeData.text[1] = metric(JSON.parse(buffer).stargazers_count);
       badgeData.colorscheme = null;
       badgeData.colorB = '#4183C4';
       sendBadge(format, badgeData);
@@ -2990,13 +3333,7 @@ cache(function(data, match, sendBadge, request) {
   var user = match[1];  // eg, qubyte/rubidium
   var repo = match[2];
   var format = match[3];
-  var apiUrl = 'https://api.github.com/repos/' + user + '/' + repo;
-  // Using our OAuth App secret grants us 5000 req/hour
-  // instead of the standard 60 req/hour.
-  if (serverSecrets) {
-    apiUrl += '?client_id=' + serverSecrets.gh_client_id
-      + '&client_secret=' + serverSecrets.gh_client_secret;
-  }
+  var apiUrl = githubApiUrl + '/repos/' + user + '/' + repo;
   var badgeData = getBadgeData('watchers', data);
   if (badgeData.template === 'social') {
     badgeData.logo = badgeData.logo || logos.github;
@@ -3005,18 +3342,13 @@ cache(function(data, match, sendBadge, request) {
       'https://github.com/' + user + '/' + repo + '/watchers',
      ];
   }
-  // A special User-Agent is required:
-  // http://developer.github.com/v3/#user-agent-required
-  request(apiUrl, { headers: githubHeaders }, function(err, res, buffer) {
+  githubAuth.request(request, apiUrl, {}, function(err, res, buffer) {
     if (err != null) {
       badgeData.text[1] = 'inaccessible';
       sendBadge(format, badgeData);
       return;
     }
     try {
-      if ((+res.headers['x-ratelimit-remaining']) === 0) {
-        return;  // Hope for the best in the cache.
-      }
       badgeData.text[1] = JSON.parse(buffer).subscribers_count;
       badgeData.colorscheme = null;
       badgeData.colorB = '#4183C4';
@@ -3033,29 +3365,18 @@ camp.route(/^\/github\/followers\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
 cache(function(data, match, sendBadge, request) {
   var user = match[1];  // eg, qubyte
   var format = match[2];
-  var apiUrl = 'https://api.github.com/users/' + user;
-  // Using our OAuth App secret grants us 5000 req/hour
-  // instead of the standard 60 req/hour.
-  if (serverSecrets) {
-    apiUrl += '?client_id=' + serverSecrets.gh_client_id
-      + '&client_secret=' + serverSecrets.gh_client_secret;
-  }
+  var apiUrl = githubApiUrl + '/users/' + user;
   var badgeData = getBadgeData('followers', data);
   if (badgeData.template === 'social') {
     badgeData.logo = badgeData.logo || logos.github;
   }
-  // A special User-Agent is required:
-  // http://developer.github.com/v3/#user-agent-required
-  request(apiUrl, { headers: githubHeaders }, function(err, res, buffer) {
+  githubAuth.request(request, apiUrl, {}, function(err, res, buffer) {
     if (err != null) {
       badgeData.text[1] = 'inaccessible';
       sendBadge(format, badgeData);
       return;
     }
     try {
-      if ((+res.headers['x-ratelimit-remaining']) === 0) {
-        return;  // Hope for the best in the cache.
-      }
       badgeData.text[1] = JSON.parse(buffer).followers;
       badgeData.colorscheme = null;
       badgeData.colorB = '#4183C4';
@@ -3073,7 +3394,7 @@ cache(function(data, match, sendBadge, request) {
   var user = match[1];  // eg, mashape
   var repo = match[2];  // eg, apistatus
   var format = match[3];
-  var apiUrl = 'https://api.github.com/repos/' + user + '/' + repo;
+  var apiUrl = githubApiUrl + '/repos/' + user + '/' + repo;
   var badgeData = getBadgeData('license', data);
   if (badgeData.template === 'social') {
     badgeData.logo = badgeData.logo || logos.github;
@@ -3098,9 +3419,7 @@ cache(function(data, match, sendBadge, request) {
       return;
     }
     try {
-      if ((+res.headers['x-ratelimit-remaining']) === 0) {
-        return;  // Hope for the best in the cache.
-      } else if (res.statusCode === 404) {
+      if (res.statusCode === 404) {
         badgeData.text[1] = 'repo not found';
         sendBadge(format, badgeData);
         return;
@@ -3114,6 +3433,67 @@ cache(function(data, match, sendBadge, request) {
         badgeData.text[1] = 'unknown license';
         sendBadge(format, badgeData);
       }
+    } catch(e) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
+    }
+  });
+}));
+
+// Bitbucket issues integration.
+camp.route(/^\/bitbucket\/issues(-raw)?\/([^\/]+)\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var isRaw = !!match[1];
+  var user = match[2];  // eg, atlassian
+  var repo = match[3];  // eg, python-bitbucket
+  var format = match[4];
+  var apiUrl = 'https://bitbucket.org/api/1.0/repositories/' + user + '/' + repo
+    + '/issues/?limit=0&status=new&status=open';
+
+  var badgeData = getBadgeData('issues', data);
+  request(apiUrl, function(err, res, buffer) {
+    if (err != null) {
+      badgeData.text[1] = 'inaccessible';
+      sendBadge(format, badgeData);
+      return;
+    }
+    try {
+      var data = JSON.parse(buffer);
+      var issues = data.count;
+      badgeData.text[1] = issues + (isRaw? '': ' open');
+      badgeData.colorscheme = issues ? 'yellow' : 'brightgreen';
+      sendBadge(format, badgeData);
+    } catch(e) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
+    }
+  });
+}));
+
+// Bitbucket pull requests integration.
+camp.route(/^\/bitbucket\/pr(-raw)?\/([^\/]+)\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var isRaw = !!match[1];
+  var user = match[2];  // eg, atlassian
+  var repo = match[3];  // eg, python-bitbucket
+  var format = match[4];
+  var apiUrl = 'https://bitbucket.org/api/2.0/repositories/'
+    + encodeURI(user) + '/' + encodeURI(repo)
+    + '/pullrequests/?limit=0&state=OPEN';
+
+  var badgeData = getBadgeData('pull requests', data);
+  request(apiUrl, function(err, res, buffer) {
+    if (err != null) {
+      badgeData.text[1] = 'inaccessible';
+      sendBadge(format, badgeData);
+      return;
+    }
+    try {
+      var data = JSON.parse(buffer);
+      var pullrequests = data.size;
+      badgeData.text[1] = metric(pullrequests) + (isRaw? '': ' open');
+      badgeData.colorscheme = (pullrequests > 0)? 'yellow': 'brightgreen';
+      sendBadge(format, badgeData);
     } catch(e) {
       badgeData.text[1] = 'invalid';
       sendBadge(format, badgeData);
@@ -3150,7 +3530,7 @@ cache(function(data, match, sendBadge, request) {
   });
 }));
 
-function mapNugetFeed(pattern, offset, getInfo) {
+function mapNugetFeedv2(pattern, offset, getInfo) {
   var vRegex = new RegExp('^\\/' + pattern + '\\/v\\/(.*)\\.(svg|png|gif|jpg|json)$');
   var vPreRegex = new RegExp('^\\/' + pattern + '\\/vpre\\/(.*)\\.(svg|png|gif|jpg|json)$');
   var dtRegex = new RegExp('^\\/' + pattern + '\\/dt\\/(.*)\\.(svg|png|gif|jpg|json)$');
@@ -3278,21 +3658,153 @@ function mapNugetFeed(pattern, offset, getInfo) {
   }));
 }
 
-// NuGet and Chocolatey
-mapNugetFeed('(nuget|chocolatey)', 1, function(match) {
-  var site = match[1];
+function mapNugetFeed(pattern, offset, getInfo) {
+  var vRegex = new RegExp('^\\/' + pattern + '\\/v\\/(.*)\\.(svg|png|gif|jpg|json)$');
+  var vPreRegex = new RegExp('^\\/' + pattern + '\\/vpre\\/(.*)\\.(svg|png|gif|jpg|json)$');
+
+  function getNugetVersion(apiUrl, id, includePre, request, done) {
+    // get service index document
+    regularUpdate(apiUrl + '/index.json',
+      // The endpoint changes once per year (ie, a period of n = 1 year).
+      // We minimize the users' waiting time for information.
+      // With l = latency to fetch the endpoint and x = endpoint update period
+      // both in years, the yearly number of queries for the endpoint are 1/x,
+      // and when the endpoint changes, we wait for up to x years to get the
+      // right endpoint.
+      // So the waiting time within n years is n*l/x + x years, for which a
+      // derivation yields an optimum at x = sqrt(n*l), roughly 42 minutes.
+      (42 * 60 * 1000),
+      function(buffer) {
+        var data = JSON.parse(buffer);
+
+        var autocompleteResources = data.resources.filter(function(resource) {
+          return resource['@type'] === 'SearchAutocompleteService';
+        });
+
+        return autocompleteResources;
+      },
+      function(err, autocompleteResources) {
+        if (err != null) { done(err); return; }
+
+        // query autocomplete service
+        var randomEndpointIdx = Math.floor(Math.random() * autocompleteResources.length);
+        var reqUrl = autocompleteResources[randomEndpointIdx]['@id']
+          + '?id=' + encodeURIComponent(id.toLowerCase())   // NuGet package id (lowercase)
+          + '&prerelease=true'                              // Include prerelease versions?
+          + '&skip=0'                                       // Start at first package found
+          + '&take=5000';                                   // Max. number of results
+
+        request(reqUrl, function(err, res, buffer) {
+          if (err != null) {
+            done(err);
+            return;
+          }
+
+          try {
+            var data = JSON.parse(buffer);
+            var versions = data.data;
+            if (!includePre) {
+              // Remove prerelease versions.
+              filteredVersions = versions.filter(function(version) {
+                return !/-/.test(version);
+              });
+              if (filteredVersions.length > 0) {
+                versions = filteredVersions;
+              }
+            }
+            var lastVersion = versions[versions.length - 1];
+            done(null, lastVersion);
+          } catch (e) { done(e); }
+        });
+      });
+  }
+
+  camp.route(vRegex,
+  cache(function(data, match, sendBadge, request) {
+    var info = getInfo(match);
+    var site = info.site;  // eg, `Chocolatey`, or `YoloDev`
+    var repo = match[offset + 1];  // eg, `Nuget.Core`.
+    var format = match[offset + 2];
+    var apiUrl = info.feed;
+    var badgeData = getBadgeData(site, data);
+    getNugetVersion(apiUrl, repo, false, request, function(err, version) {
+      if (err != null) {
+        badgeData.text[1] = 'inaccessible';
+        sendBadge(format, badgeData);
+        return;
+      }
+      try {
+        badgeData.text[1] = 'v' + version;
+        if (version.indexOf('-') !== -1) {
+          badgeData.colorscheme = 'yellow';
+        } else if (version[0] === '0') {
+          badgeData.colorscheme = 'orange';
+        } else {
+          badgeData.colorscheme = 'blue';
+        }
+        sendBadge(format, badgeData);
+      } catch(e) {
+        badgeData.text[1] = 'invalid';
+        sendBadge(format, badgeData);
+      }
+    });
+  }));
+
+  camp.route(vPreRegex,
+  cache(function(data, match, sendBadge, request) {
+    var info = getInfo(match);
+    var site = info.site;  // eg, `Chocolatey`, or `YoloDev`
+    var repo = match[offset + 1];  // eg, `Nuget.Core`.
+    var format = match[offset + 2];
+    var apiUrl = info.feed;
+    var badgeData = getBadgeData(site, data);
+    getNugetVersion(apiUrl, repo, true, request, function(err, version) {
+      if (err != null) {
+        badgeData.text[1] = 'inaccessible';
+        sendBadge(format, badgeData);
+        return;
+      }
+      try {
+        badgeData.text[1] = 'v' + version;
+        if (version.indexOf('-') !== -1) {
+          badgeData.colorscheme = 'yellow';
+        } else if (version[0] === '0') {
+          badgeData.colorscheme = 'orange';
+        } else {
+          badgeData.colorscheme = 'blue';
+        }
+        sendBadge(format, badgeData);
+      } catch(e) {
+        badgeData.text[1] = 'invalid';
+        sendBadge(format, badgeData);
+      }
+    });
+  }));
+}
+
+// Chocolatey
+mapNugetFeedv2('chocolatey', 0, function(match) {
   return {
-    site: site,
-    feed: 'https://www.' + site + '.org/api/v2'
+    site: 'chocolatey',
+    feed: 'https://www.chocolatey.org/api/v2'
+  };
+});
+
+// NuGet
+mapNugetFeed('nuget', 0, function(match) {
+  return {
+    site: 'nuget',
+    feed: 'https://api.nuget.org/v3'
   };
 });
 
 // MyGet
-mapNugetFeed('myget\\/(.*)', 1, function(match) {
-  var feed = match[1];
+mapNugetFeed('(.+\\.)?myget\\/(.*)', 2, function(match) {
+  var tenant = match[1] || 'www.';  // eg. dotnet
+  var feed = match[2];
   return {
     site: feed,
-    feed: 'https://www.myget.org/F/' + feed + '/api/v2'
+    feed: 'https://' + tenant + 'myget.org/F/' + feed + '/api/v3'
   };
 });
 
@@ -3402,16 +3914,19 @@ cache(function(data, match, sendBadge, request) {
 }));
 
 // Jenkins build status integration
-camp.route(/^\/jenkins(-ci)?\/s\/(http(s)?)\/((?:[^\/]+)(?:\/.+?)?)\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
+camp.route(/^\/jenkins(?:-ci)?\/s\/(http(?:s)?)\/([^\/]+)\/(.+)\.(svg|png|gif|jpg|json)$/,
 cache(function(data, match, sendBadge, request) {
-  var scheme = match[2];  // http(s)
-  var host = match[4];  // jenkins.qa.ubuntu.com
-  var job = match[5];  // precise-desktop-amd64_default
-  var format = match[6];
+  var scheme = match[1];  // http(s)
+  var host = match[2];  // example.org:8080
+  var job = match[3];  // folder/job
+  var format = match[4];
   var options = {
     json: true,
     uri: scheme + '://' + host + '/job/' + job + '/api/json?tree=color'
   };
+  if (job.indexOf('/') > -1 ) {
+    options.uri = scheme + '://' + host + '/' + job + '/api/json?tree=color';
+  }
 
   if (serverSecrets && serverSecrets.jenkins_user) {
     options.auth = {
@@ -3455,17 +3970,21 @@ cache(function(data, match, sendBadge, request) {
 }));
 
 // Jenkins tests integration
-camp.route(/^\/jenkins(-ci)?\/t\/(http(s)?)\/((?:[^\/]+)(?:\/.+?)?)\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
+camp.route(/^\/jenkins(?:-ci)?\/t\/(http(?:s)?)\/([^\/]+)\/(.+)\.(svg|png|gif|jpg|json)$/,
 cache(function(data, match, sendBadge, request) {
-  var scheme = match[2];  // http(s)
-  var host = match[4];  // jenkins.qa.ubuntu.com
-  var job = match[5];  // precise-desktop-amd64_default
-  var format = match[6];
+  var scheme = match[1];  // http(s)
+  var host = match[2];  // example.org:8080
+  var job = match[3];  // folder/job
+  var format = match[4];
   var options = {
     json: true,
     uri: scheme + '://' + host + '/job/' + job
       + '/lastBuild/api/json?tree=actions[failCount,skipCount,totalCount]'
   };
+  if (job.indexOf('/') > -1 ) {
+    options.uri = scheme + '://' + host + '/' + job
+      + '/lastBuild/api/json?tree=actions[failCount,skipCount,totalCount]';
+  }
 
   if (serverSecrets && serverSecrets.jenkins_user) {
     options.auth = {
@@ -3511,17 +4030,21 @@ cache(function(data, match, sendBadge, request) {
 }));
 
 // Jenkins coverage integration
-camp.route(/^\/jenkins(-ci)?\/c\/(http(s)?)\/((?:[^\/]+)(?:\/.+?)?)\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
+camp.route(/^\/jenkins(?:-ci)?\/c\/(http(?:s)?)\/([^\/]+)\/(.+)\.(svg|png|gif|jpg|json)$/,
 cache(function(data, match, sendBadge, request) {
-  var scheme = match[2];  // http(s)
-  var host = match[4];  // jenkins.qa.ubuntu.com
-  var job = match[5];  // precise-desktop-amd64_default
-  var format = match[6];
+  var scheme = match[1];  // http(s)
+  var host = match[2];  // example.org:8080
+  var job = match[3];  // folder/job
+  var format = match[4];
   var options = {
     json: true,
     uri: scheme + '://' + host + '/job/' + job
       + '/lastBuild/cobertura/api/json?tree=results[elements[name,denominator,numerator,ratio]]'
   };
+  if (job.indexOf('/') > -1 ) {
+    options.uri = scheme + '://' + host + '/' + job
+      + '/lastBuild/cobertura/api/json?tree=results[elements[name,denominator,numerator,ratio]]';
+  }
 
   if (serverSecrets && serverSecrets.jenkins_user) {
     options.auth = {
@@ -3583,8 +4106,7 @@ cache(function(data, match, sendBadge, request) {
     }
     try {
       if (type === 'role') {
-        badgeData.text[1] = json.summary_fields.owner.username +
-          '.' + json.name;
+        badgeData.text[1] = json.namespace + '.' + json.name;
         badgeData.colorscheme = 'blue';
       } else {
         badgeData.text[1] = 'unknown';
@@ -3604,7 +4126,7 @@ cache(function(data, match, sendBadge, request) {
   var branch = match[2];
   var options = {
     method: 'GET',
-    uri: 'https://www.codeship.io/projects/' + projectId + '/status' + (branch != null ? '?branch=' + branch : '')
+    uri: 'https://codeship.com/projects/' + projectId + '/status' + (branch != null ? '?branch=' + branch : '')
   };
   var badgeData = getBadgeData('build', data);
   request(options, function(err, res) {
@@ -3686,7 +4208,6 @@ cache(function(data, match, sendBadge, request) {
         case 'pass':
           badgeData.text[1] = 'passing';
           badgeData.colorscheme = 'brightgreen';
-          break;
           break;
         case 'fail':
           badgeData.text[1] = 'failing';
@@ -3970,12 +4491,13 @@ cache(function(data, match, sendBadge, request) {
 }));
 
 // SourceForge integration.
-camp.route(/^\/sourceforge\/([^\/]+)\/(.*)\.(svg|png|gif|jpg|json)$/,
+camp.route(/^\/sourceforge\/([^\/]+)\/([^/]*)\/?(.*).(svg|png|gif|jpg|json)$/,
 cache(function(data, match, sendBadge, request) {
   var info = match[1];      // eg, 'dm'
   var project = match[2];   // eg, 'sevenzip`.
-  var format = match[3];
-  var apiUrl = 'http://sourceforge.net/projects/' + project + '/files/stats/json';
+  var folder = match[3];
+  var format = match[4];
+  var apiUrl = 'http://sourceforge.net/projects/' + project + '/files/' + folder + '/stats/json';
   var badgeData = getBadgeData('sourceforge', data);
   var time_period, start_date, end_date;
   if (info.charAt(0) === 'd') {
@@ -4169,15 +4691,16 @@ cache(function(data, match, sendBadge, request) {
 
 // CircleCI build integration.
 // https://circleci.com/api/v1/project/BrightFlair/PHP.Gt?circle-token=0a5143728784b263d9f0238b8d595522689b3af2&limit=1&filter=completed
-camp.route(/^\/circleci\/(?:token\/(\w+))?[+\/]?project\/([^\/]+\/[^\/]+)(?:\/(.*))?\.(svg|png|gif|jpg|json)$/,
+camp.route(/^\/circleci\/(?:token\/(\w+))?[+\/]?project\/(?:(github|bitbucket)\/)?([^\/]+\/[^\/]+)(?:\/(.*))?\.(svg|png|gif|jpg|json)$/,
 cache(function(data, match, sendBadge, request) {
-  var token = match[1]
-  var userRepo = match[2];  // eg, `BrightFlair/PHP.Gt`.
-  var branch = match[3];
-  var format = match[4];
+  var token = match[1];
+  var type = match[2] || 'github'; // github OR bitbucket
+  var userRepo = match[3];  // eg, `RedSparr0w/node-csgo-parser`.
+  var branch = match[4]
+  var format = match[5];
 
   // Base API URL
-  var apiUrl = 'https://circleci.com/api/v1/project/' + userRepo;
+  var apiUrl = 'https://circleci.com/api/v1.1/project/' + type + '/' + userRepo;
 
   // Query Params
   queryParams = {};
@@ -4185,7 +4708,7 @@ cache(function(data, match, sendBadge, request) {
   queryParams['filter'] = 'completed';
 
   // Custom Banch if present
-  if(branch != null) {
+  if (branch != null) {
     apiUrl += "/tree/" + branch;
   }
 
@@ -4201,6 +4724,11 @@ cache(function(data, match, sendBadge, request) {
   request(apiUrl, {json:true}, function(err, res, data) {
     if (err != null) {
       badgeData.text[1] = 'inaccessible';
+      sendBadge(format, badgeData);
+      return;
+    }
+    if (data.message !== undefined){
+      badgeData.text[1] = data.message;
       sendBadge(format, badgeData);
       return;
     }
@@ -4224,9 +4752,7 @@ cache(function(data, match, sendBadge, request) {
         badgeData.colorscheme = 'yellow';
       default:
         badgeData.text[1] = status.replace('_', ' ');
-        break;
       }
-
       sendBadge(format, badgeData);
     } catch(e) {
       badgeData.text[1] = 'invalid';
@@ -4281,7 +4807,7 @@ cache(function(data, match, sendBadge, request) {
   request(url, function (err, res, buffer) {
     if (err != null) {
       badgeData.text[1] = 'inaccessible';
-      sendBadge(badgeData, format);
+      sendBadge(format, badgeData);
       return;
     }
     try {
@@ -4419,7 +4945,7 @@ cache(function(data, match, sendBadge, request) {
     user = 'library';
   }
   var path = user + '/' + repo;
-  var url = 'https://registry.hub.docker.com/v2/repositories/' + path + '/stars/count/';
+  var url = 'https://hub.docker.com/v2/repositories/' + path + '/stars/count/';
   var badgeData = getBadgeData('docker stars', data);
   request(url, function(err, res, buffer) {
     if (err != null) {
@@ -4450,7 +4976,7 @@ cache(function(data, match, sendBadge, request) {
     user = 'library';
   }
   var path = user + '/' + repo;
-  var url = 'https://registry.hub.docker.com/v2/repositories/' + path;
+  var url = 'https://hub.docker.com/v2/repositories/' + path;
   var badgeData = getBadgeData('docker pulls', data);
   request(url, function(err, res, buffer) {
     if (err != null) {
@@ -4463,6 +4989,44 @@ cache(function(data, match, sendBadge, request) {
       var pulls = data.pull_count;
       badgeData.text[1] = metric(pulls);
       badgeData.colorscheme = null;
+      badgeData.colorB = '#008bb8';
+      sendBadge(format, badgeData);
+    } catch(e) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
+    }
+  });
+}));
+
+
+// Docker Hub automated integration.
+camp.route(/^\/docker\/automated\/([^\/]+)\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var user = match[1];  // eg, jrottenberg
+  var repo = match[2];  // eg, ffmpeg
+  var format = match[3];
+  if (user === '_') {
+    user = 'library';
+  }
+  var path = user + '/' + repo;
+  var url = 'https://registry.hub.docker.com/v2/repositories/' + path;
+  var badgeData = getBadgeData('docker build', data);
+  request(url, function(err, res, buffer) {
+    if (err != null) {
+      badgeData.text[1] = 'inaccessible';
+      sendBadge(format, badgeData);
+      return;
+    }
+    try {
+      var data = JSON.parse(buffer);
+      var is_automated = data.is_automated;
+      if (is_automated) {
+        badgeData.text[1] = 'automated';
+        badgeData.colorscheme = 'blue';
+      } else {
+        badgeData.text[1] = 'manual';
+        badgeData.colorscheme = 'yellow';
+      }
       badgeData.colorB = '#008bb8';
       sendBadge(format, badgeData);
     } catch(e) {
@@ -4490,7 +5054,8 @@ cache(function(data, match, sendBadge, request) {
      ];
   }
   badgeData.text[1] = '';
-  badgeData.colorscheme = '55ACEE';
+  badgeData.colorscheme = null;
+  badgeData.colorB = data.colorB || '#55ACEE';
   sendBadge(format, badgeData);
 }));
 
@@ -4502,9 +5067,10 @@ cache(function(data, match, sendBadge, request) {
   var options = {
     url: 'http://cdn.syndication.twimg.com/widgets/followbutton/info.json?screen_names=' + user
   };
-  var badgeData = getBadgeData('Follow', data);
-  badgeData.text[0] = 'Follow ' + user;
-  badgeData.colorscheme = '55ACEE';
+  var badgeData = getBadgeData('Follow @' + user, data);
+
+  badgeData.colorscheme = null;
+  badgeData.colorB = '#55ACEE';
   if (badgeData.template === 'social') {
     badgeData.logo = badgeData.logo || logos.twitter;
   }
@@ -4522,7 +5088,7 @@ cache(function(data, match, sendBadge, request) {
       // The data is formatted as an array.
       var data = JSON.parse(buffer)[0];
       // data.followers_count could be zero… don't just check if falsey.
-      if (data.followers_count != null){
+      if (data !== undefined && data.followers_count != null){
         badgeData.text[1] = metric(data.followers_count);
       }
     } catch(e) {
@@ -4565,7 +5131,7 @@ cache(function(data, match, sendBadge, request) {
   });
 }));
 
-// Visual Studio Online build integration.
+// Visual Studio Team Services build integration.
 camp.route(/^\/vso\/build\/([^\/]+)\/([^\/]+)\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
 cache(function(data, match, sendBadge, request) {
   var name = match[1];    // User name
@@ -4653,9 +5219,38 @@ cache(function(data, match, sendBadge, request) {
   badgeData.colorscheme = 'brightgreen';
   if (darkBackgroundTemplates.some(function(t) { return t === badgeData.template; })) {
     badgeData.logo = badgeData.logo || logos['gitter-white'];
-    badgeData.logoWidth = 7;
+    badgeData.logoWidth = 9;
   }
   sendBadge(format, badgeData);
+}));
+
+// homebrew integration
+camp.route(/^\/homebrew\/v\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var pkg = match[1];  // eg. cake
+  var format = match[2];
+  var apiUrl = 'http://braumeister.org/formula/' + pkg + '/version';
+
+  var badgeData = getBadgeData('homebrew', data);
+  request(apiUrl, { headers: { 'Accept': 'application/json' } }, function(err, res, buffer) {
+    if (err != null) {
+      badgeData.text[1] = 'inaccessible';
+      sendBadge(format, badgeData);
+    }
+    try {
+      var data = JSON.parse(buffer);
+      var version = data.stable;
+
+      var vdata = versionColor(version);
+      badgeData.text[1] = vdata.version;
+      badgeData.colorscheme = vdata.color;
+
+      sendBadge(format, badgeData);
+    } catch(e) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
+    }
+  });
 }));
 
 // StackExchange integration.
@@ -4680,11 +5275,16 @@ cache(function(data, match, sendBadge, request) {
   request(options, function (err, res, buffer) {
     if (err != null) {
       badgeData.text[1] = 'inaccessible';
-      sendBadge(badgeData, format);
+      sendBadge(format, badgeData);
       return;
     }
     try {
       var data = JSON.parse(buffer.toString());
+
+      // IP rate limiting
+      if (data.error_name === 'throttle_violation') {
+        return;  // Hope for the best in the cache.
+      }
 
       if (info === 'r') {
         var reputation = data.items[0].reputation;
@@ -4699,12 +5299,42 @@ cache(function(data, match, sendBadge, request) {
       }
       sendBadge(format, badgeData);
     } catch(e) {
-      console.error('Stack Exchange badge error: ' + e.stack);
       badgeData.text[1] = 'invalid';
       sendBadge(format, badgeData);
     }
   })}
 ));
+
+// beerpay.io integration.
+// e.g. JSON response: https://beerpay.io/api/v1/beerpay/projects/beerpay.io
+// e.g. SVG badge: https://beerpay.io/beerpay/beerpay.io/badge.svg?style=flat-square
+camp.route(/^\/beerpay\/(.*)\/(.*)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var user = match[1];     // eg, beerpay
+  var project = match[2];  // eg, beerpay.io
+  var format = match[3];
+
+  var apiUrl = 'https://beerpay.io/api/v1/' + user + '/projects/' + project;
+  var badgeData = getBadgeData('beerpay', data);
+
+  request(apiUrl, function (err, res, buffer) {
+    if (err) {
+      badgeData.text[1] = 'inaccessible';
+      sendBadge(format, badgeData);
+      return;
+    }
+
+    try {
+      var data = JSON.parse(buffer);
+      badgeData.text[1] = '$' + (data.total_amount || 0);
+      badgeData.colorscheme = 'red';
+      sendBadge(format, badgeData);
+    } catch (e) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
+    }
+  });
+}));
 
 // Maintenance integration.
 camp.route(/^\/maintenance\/([^\/]+)\/([^\/]+)\.(svg|png|gif|jpg|json)$/,
@@ -4734,6 +5364,409 @@ cache(function(data, match, sendBadge, request) {
   }
 }));
 
+// bitHound integration
+camp.route(/^\/bithound\/(code\/|dependencies\/|devDependencies\/)?(.+?)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var type = match[1].slice(0, -1);
+  var userRepo = match[2];  // eg, `github/rexxars/sse-channel`.
+  var format = match[3];
+  var apiUrl = 'https://www.bithound.io/api/' + userRepo + '/badge/' + type;
+  var badgeData = getBadgeData(type === 'devDependencies' ? 'dev dependencies' : type, data);
+
+  request(apiUrl, { headers: { 'Accept': 'application/json' } }, function(err, res, buffer) {
+    try {
+      var data = JSON.parse(buffer);
+      badgeData.text[1] = data.label;
+      badgeData.logo = logos['bithound'];
+      badgeData.logoWidth = 15;
+      badgeData.colorscheme = null;
+      badgeData.colorB = '#' + data.color;
+      sendBadge(format, badgeData);
+
+    } catch(e) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
+    }
+  });
+}));
+
+// Waffle.io integration
+camp.route(/^\/waffle\/label\/([^\/]+)\/([^\/]+)\/?([^\/]+)?\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var user = match[1];  // eg, evancohen
+  var repo = match[2];  // eg, smart-mirror
+  var ghLabel = match[3] || 'ready';  // eg, in%20progress
+  var format = match[4];
+  var apiUrl = 'https://api.waffle.io/' + user + '/' + repo + '/cards';
+  var badgeData = getBadgeData('issues', data);
+
+  request(apiUrl, function(err, res, buffer) {
+    try {
+      var cards = JSON.parse(buffer);
+      if (cards.length === 0) {
+        badgeData.text[1] = 'absent';
+        sendBadge(format, badgeData);
+        return;
+      }
+      var count = 0;
+      var color;
+      for (var i = 0; i < cards.length; i++) {
+        var cardMetadata = cards[i].githubMetadata;
+        if (cardMetadata.labels && cardMetadata.labels.length > 0) {
+          for (var j = 0; j < cardMetadata.labels.length; j++) {
+            var label = cardMetadata.labels[j];
+            if (label.name === ghLabel) {
+              count++;
+              color = label.color;
+            }
+          }
+        }
+      }
+      badgeData.text[0] = data.label || ghLabel;
+      badgeData.text[1] = '' + count;
+      badgeData.colorscheme = null;
+      badgeData.colorB = '#' + (color || '78bdf2');
+      sendBadge(format, badgeData);
+    } catch(e) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
+    }
+  });
+}));
+
+// Arch user repository (AUR) integration.
+camp.route(/^\/aur\/(version|votes|license)\/(.*)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var info = match[1];
+  var pkg = match[2];
+  var format = match[3];
+  var apiUrl = 'https://aur.archlinux.org/rpc.php?type=info&arg=' + pkg;
+  var badgeData = getBadgeData('AUR', data);
+  request(apiUrl, function(err, res, buffer) {
+    if (err != null) {
+      badgeData.text[1] = 'inaccessible';
+      sendBadge(format, badgeData);
+      return;
+    }
+    try {
+      var data = JSON.parse(buffer).results;
+      if (info === 'version') {
+        var vdata = versionColor(data.Version);
+        badgeData.text[1] = vdata.version;
+        if (data.OutOfDate === null) {
+          badgeData.colorscheme = 'blue';
+        } else {
+          badgeData.colorscheme = 'orange';
+        }
+      } else if (info === 'votes') {
+        var votes = data.NumVotes;
+        badgeData.text[0] = "votes";
+        badgeData.text[1] = votes;
+        badgeData.colorscheme = floorCountColor(votes, 2, 20, 60);
+      } else if (info === 'license') {
+        var license = data.License;
+        badgeData.text[0] = "license";
+        badgeData.text[1] = license;
+        badgeData.colorscheme = 'blue';
+      }
+      sendBadge(format, badgeData);
+    } catch(e) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
+    }
+  });
+}));
+
+// Chrome web store integration
+camp.route(/^\/chrome-web-store\/(v|d|price|rating|stars|rating-count)\/(.*)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var type = match[1];
+  var storeId = match[2];  // eg, nimelepbpejjlbmoobocpfnjhihnpked
+  var format = match[3];
+  var badgeData = getBadgeData('chrome web store', data);
+  var url = 'https://chrome.google.com/webstore/detail/' + storeId + '?hl=en&gl=US';
+  var chromeWebStore = require('chrome-web-store-item-property');
+  request(url, function(err, res, buffer) {
+    if (err != null) {
+      badgeData.text[1] = 'inaccessible';
+      sendBadge(format, badgeData);
+      return;
+    }
+    chromeWebStore.convert(buffer)
+      .then(function (value) {
+        if (type === 'v') {
+          var vdata = versionColor(value.version);
+          badgeData.text[1] = vdata.version;
+          badgeData.colorscheme = vdata.color;
+        } else if (type === 'd') {
+          var downloads = value.interactionCount.UserDownloads;
+          badgeData.text[0] = data.label || 'downloads';
+          badgeData.text[1] = metric(downloads) + ' total';
+          badgeData.colorscheme = downloadCountColor(downloads);
+        } else if (type === 'price') {
+          badgeData.text[0] = data.label || 'price';
+          badgeData.text[1] = currencyFromCode(value.priceCurrency) +
+            value.price;
+          badgeData.colorscheme = 'brightgreen';
+        } else if (type === 'rating') {
+          var rating = Math.round(value.ratingValue * 100) / 100;
+          badgeData.text[0] = data.label || 'rating';
+          badgeData.text[1] = rating + '/5';
+          badgeData.colorscheme = floorCountColor(rating, 2, 3, 4);
+        } else if (type === 'stars') {
+          var rating = Math.round(value.ratingValue);
+          badgeData.text[0] = data.label || 'rating';
+          badgeData.text[1] = starRating(rating);
+          badgeData.colorscheme = floorCountColor(rating, 2, 3, 4);
+        } else if (type === 'rating-count') {
+          var ratingCount = value.ratingCount;
+          badgeData.text[0] = data.label || 'rating count';
+          badgeData.text[1] = metric(ratingCount) + ' total';
+          badgeData.colorscheme = floorCountColor(ratingCount, 5, 50, 500);
+        }
+        sendBadge(format, badgeData);
+      }).catch(function (err) {
+        badgeData.text[1] = 'invalid';
+        sendBadge(format, badgeData);
+      });
+  });
+}));
+
+// Mozilla addons integration
+camp.route(/^\/amo\/(v|d|rating|stars|users)\/(.*)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var type = match[1];
+  var addonId = match[2];
+  var format = match[3];
+  var badgeData = getBadgeData('mozilla add-on', data);
+  var url = 'https://services.addons.mozilla.org/api/1.5/addon/' + addonId;
+
+  request(url, function(err, res, buffer) {
+    if (err) {
+      badgeData.text[1] = 'inaccessible';
+      sendBadge(format, badgeData);
+      return;
+    }
+
+    xml2js.parseString(buffer.toString(), function (err, data) {
+      if (err) {
+        badgeData.text[1] = 'invalid';
+        sendBadge(format, badgeData);
+        return;
+      }
+
+      try {
+        switch (type) {
+        case 'v':
+          var version = data.addon.version[0];
+          var vdata = versionColor(version);
+          badgeData.text[1] = vdata.version;
+          badgeData.colorscheme = vdata.color;
+          break;
+        case 'd':
+          var downloads = parseInt(data.addon.total_downloads[0], 10);
+          badgeData.text[0] = 'downloads';
+          badgeData.text[1] = metric(downloads);
+          badgeData.colorscheme = downloadCountColor(downloads);
+          break;
+        case 'rating':
+          var rating = parseInt(data.addon.rating, 10);
+          badgeData.text[0] = 'rating';
+          badgeData.text[1] = rating + '/5';
+          badgeData.colorscheme = floorCountColor(rating, 2, 3, 4);
+          break;
+        case 'stars':
+          var rating = parseInt(data.addon.rating, 10);
+          badgeData.text[0] = 'rating';
+          badgeData.text[1] = starRating(rating);
+          badgeData.colorscheme = floorCountColor(rating, 2, 3, 4);
+          break;
+        case 'users':
+          var dailyUsers = parseInt(data.addon.daily_users[0], 10);
+          badgeData.text[0] = 'users';
+          badgeData.text[1] = metric(dailyUsers);
+          badgeData.colorscheme = 'brightgreen';
+          break;
+        }
+
+        sendBadge(format, badgeData);
+      } catch (err) {
+        badgeData.text[1] = 'invalid';
+        sendBadge(format, badgeData);
+      }
+    });
+  });
+}));
+
+// Test if a webpage is online
+camp.route(/^\/website(-(([^-]|--)*?)-(([^-]|--)*)(-(([^-]|--)+)-(([^-]|--)+))?)?\/(.+)\/(.+)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var onlineMessage = escapeFormat(match[2] != null ? match[2] : "online");
+  var offlineMessage = escapeFormat(match[4] != null ? match[4] : "offline");
+  var onlineColor = escapeFormat(match[7] != null ? match[7] : "brightgreen");
+  var offlineColor = escapeFormat(match[9] != null ? match[9] : "red");
+  var userProtocol = match[11];
+  var userURI = match[12];
+  var format = match[13];
+  var withProtocolURI = userProtocol + "://" + userURI;
+  var options = {
+    method: 'HEAD',
+    uri: withProtocolURI,
+  };
+  var badgeData = getBadgeData('website', data);
+  badgeData.colorscheme = undefined;
+  request(options, function(err, res) {
+    try {
+      // We consider all HTTP status codes below 310 as success.
+      if (err != null || res.statusCode >= 310) {
+        badgeData.text[1] = offlineMessage;
+        if (sixHex(offlineColor)) {
+          badgeData.colorB = '#' + offlineColor;
+        } else {
+          badgeData.colorscheme = offlineColor;
+        }
+        sendBadge(format, badgeData);
+        return;
+      } else {
+        badgeData.text[1] = onlineMessage;
+        if (sixHex(onlineColor)) {
+          badgeData.colorB = '#' + onlineColor;
+        } else {
+          badgeData.colorscheme = onlineColor;
+        }
+        sendBadge(format, badgeData);
+        return;
+      }
+    } catch(e) {
+      badge({text: ['error', 'bad badge'], colorscheme: 'red'},
+        makeSend(format, ask.res, end));
+    }
+  });
+}));
+
+// Issue Stats integration.
+camp.route(/^\/issuestats\/([^\/]+)(\/long)?\/([^\/]+)\/(.+)\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+  var type = match[1];      // e.g. `i` for Issue or `p` for PR
+  var longForm = !!match[2];
+  var host = match[3];      // e.g. `github`
+  var userRepo = match[4];  // e.g. `ruby/rails`
+  var format = match[5];
+
+  var badgeData = getBadgeData('Issue Stats', data);
+
+  // Maps type name from URL to JSON property name prefix for badge data
+  var typeToPropPrefix = {
+    i: 'issue',
+    p: 'pr'
+  };
+  var typePropPrefix = typeToPropPrefix[type];
+  if (typePropPrefix === undefined) {
+    badgeData.text[1] = 'invalid';
+    sendBadge(format, badgeData);
+    return;
+  }
+
+  var url = 'http://issuestats.com/' + host + '/' + userRepo;
+  var qs = {format: 'json'};
+  if (!longForm) {
+    qs.concise = true;
+  }
+  var options = {
+    method: 'GET',
+    url: url,
+    qs: qs,
+    gzip: true,
+    json: true
+  };
+  request(options, function(err, res, json) {
+    if (err != null || res.statusCode >= 500) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
+      return;
+    }
+
+    if (res.statusCode >= 400 || !json || typeof json !== 'object') {
+      badgeData.text[1] = 'not found';
+      sendBadge(format, badgeData);
+      return;
+    }
+
+    try {
+      var label = json[typePropPrefix + '_badge_preamble'];
+      var value = json[typePropPrefix + '_badge_words'];
+      var color = json[typePropPrefix + '_badge_color'];
+
+      if (label != null) badgeData.text[0] = label;
+      badgeData.text[1] = value || 'invalid';
+      if (color != null) badgeData.colorscheme = color;
+
+      sendBadge(format, badgeData);
+    } catch (e) {
+      badgeData.text[1] = 'invalid';
+      sendBadge(format, badgeData);
+    }
+  });
+}));
+
+// Libraries.io integration.
+camp.route(/^\/librariesio\/(github|release)\/([\w\-\_]+\/[\w\-\_]+)\/?([\w\-\_\.]+)?\.(svg|png|gif|jpg|json)$/,
+cache(function(data, match, sendBadge, request) {
+
+  var resource  = match[1];
+  var project   = match[2];
+  var version   = match[3];
+  var format    = match[4];
+
+  var uri;
+  switch (resource) {
+    case 'github':
+      uri = 'https://libraries.io/api/github/' + project + '/dependencies';
+      break;
+    case 'release':
+      var v = version || 'latest';
+      uri = 'https://libraries.io/api/' + project + '/' + v + '/dependencies';
+      break;
+  }
+
+  var options = {method: 'GET', json: true, uri: uri};
+  var badgeData = getBadgeData('dependencies', data);
+
+  request(options, function(err, res, json) {
+
+    if (err || res.statusCode !== 200) {
+      badgeData.text[1] = 'not available';
+      return sendBadge(format, badgeData);
+    }
+
+    var deprecated = json.dependencies.filter(function(dep) {
+      return dep.deprecated;
+    });
+
+    var outofdate = json.dependencies.filter(function(dep) {
+      return dep.outdated;
+    });
+
+    // Deprecated dependencies are really bad
+    if (deprecated.length > 0) {
+      badgeData.colorscheme = 'red';
+      badgeData.text[1] = deprecated.length + ' deprecated';
+      return sendBadge(format, badgeData);
+    }
+
+    // Out of date dependencies are pretty bad
+    if (outofdate.length > 0) {
+      badgeData.colorscheme = 'orange';
+      badgeData.text[1] = outofdate.length + ' out of date';
+      return sendBadge(format, badgeData);
+    }
+
+    // Up to date dependencies are good!
+    badgeData.colorscheme = 'brightgreen';
+    badgeData.text[1] = 'up to date';
+    return sendBadge(format, badgeData);
+  });
+}));
 
 // Any badge.
 camp.route(/^\/(:|badge\/)(([^-]|--)*?)-(([^-]|--)*)-(([^-]|--)+)\.(svg|png|gif|jpg)$/,
@@ -4750,13 +5783,9 @@ function(data, match, end, ask) {
     incrMonthlyAnalytics(analytics.rawFlatSquareMonthly);
   }
 
-  if (ask.req.headers['cache-control']) {
-    ask.res.setHeader('Cache-Control', ask.req.headers['cache-control']);
-  } else {
-    // Cache management - the badge is constant.
-    var cacheDuration = (3600*24*1)|0;    // 1 day.
-    ask.res.setHeader('Cache-Control', 'public, max-age=' + cacheDuration);
-  }
+  // Cache management - the badge is constant.
+  var cacheDuration = (3600*24*1)|0;    // 1 day.
+  ask.res.setHeader('Cache-Control', 'max-age=' + cacheDuration);
   if (+(new Date(ask.req.headers['if-modified-since'])) >= +serverStartTime) {
     ask.res.statusCode = 304;
     ask.res.end();  // not modified.
@@ -4770,10 +5799,12 @@ function(data, match, end, ask) {
     badgeData.colorscheme = undefined;
     if (data.label !== undefined) { badgeData.text[0] = '' + data.label; }
     badgeData.text[1] = status;
-    if (sixHex(color)) {
-      badgeData.colorB = '#' + color;
-    } else {
-      badgeData.colorscheme = color;
+    if (badgeData.colorB === undefined) {
+      if (sixHex(color)) {
+        badgeData.colorB = '#' + color;
+      } else if (badgeData.colorA === undefined) {
+        badgeData.colorscheme = color;
+      }
     }
     if (data.style && validTemplates.indexOf(data.style) > -1) {
       badgeData.template = data.style;
@@ -4786,6 +5817,21 @@ function(data, match, end, ask) {
   }
 });
 
+// Production cache debugging.
+var bitFlip = false;
+camp.route(/^\/flip\.svg$/, function(data, match, end, ask) {
+  var cacheSecs = 60;
+  ask.res.setHeader('Cache-Control', 'max-age=' + cacheSecs);
+  var reqTime = new Date();
+  var date = (new Date(+reqTime + cacheSecs * 1000)).toGMTString();
+  ask.res.setHeader('Expires', date);
+  var badgeData = getBadgeData('flip', data);
+  bitFlip = !bitFlip;
+  badgeData.text[1] = bitFlip? 'on': 'off';
+  badgeData.colorscheme = bitFlip? 'brightgreen': 'red';
+  badge(badgeData, makeSend('svg', ask.res, end));
+});
+
 // Any badge, old version.
 camp.route(/^\/([^\/]+)\/(.+).png$/,
 function(data, match, end, ask) {
@@ -4795,7 +5841,7 @@ function(data, match, end, ask) {
 
   // Cache management - the badge is constant.
   var cacheDuration = (3600*24*1)|0;    // 1 day.
-  ask.res.setHeader('Cache-Control', 'public, max-age=' + cacheDuration);
+  ask.res.setHeader('Cache-Control', 'max-age=' + cacheDuration);
   if (+(new Date(ask.req.headers['if-modified-since'])) >= +serverStartTime) {
     ask.res.statusCode = 304;
     ask.res.end();  // not modified.
@@ -4839,7 +5885,11 @@ function getLabel(label, data) {
   return data.label || label;
 }
 
-// data (URL query) can include `label`, `style`, `logo`, `logoWidth`, `link`.
+function colorParam(color) { return (sixHex(color) ? '#' : '') + color }
+
+// data (URL query) can include `label`, `style`, `logo`, `logoWidth`, `link`,
+// `colorA`, `colorB`.
+// It can also include `maxAge`.
 function getBadgeData(defaultLabel, data) {
   var label = getLabel(defaultLabel, data);
   var template = data.style || 'default';
@@ -4858,6 +5908,13 @@ function getBadgeData(defaultLabel, data) {
     data.logo = 'data:' + data.logo;
   }
 
+  if (data.colorA !== undefined) {
+    data.colorA = colorParam(data.colorA);
+  }
+  if (data.colorB !== undefined) {
+    data.colorB = colorParam(data.colorB);
+  }
+
   return {
     text: [label, 'n/a'],
     colorscheme: 'lightgrey',
@@ -4865,6 +5922,8 @@ function getBadgeData(defaultLabel, data) {
     logo: data.logo,
     logoWidth: +data.logoWidth,
     links: data.link,
+    colorA: data.colorA,
+    colorB: data.colorB
   };
 }
 
@@ -4929,18 +5988,6 @@ function regularUpdate(url, interval, scraper, cb) {
   });
 }
 
-var githubHeaders = {
-  'User-Agent': 'Shields.io',
-  'Accept': 'application/vnd.github.v3+json'
-};
-
-// Personal tokens allow access to GitHub private repositories.
-// You can manage your personal GitHub token at
-// <https://github.com/settings/tokens>.
-if (serverSecrets && serverSecrets.gh_token) {
-  githubHeaders['Authorization'] = 'token ' + serverSecrets.gh_token;
-}
-
 // Given a number, string with appropriate unit in the metric system, SI.
 // Note: numbers beyond the peta- cannot be represented as integers in JS.
 var metricPrefix = ['k', 'M', 'G', 'T', 'P', 'E', 'Z', 'Y'];
@@ -4949,7 +5996,7 @@ var metricPower = metricPrefix
 function metric(n) {
   for (var i = metricPrefix.length - 1; i >= 0; i--) {
     var limit = metricPower[i];
-    if (n > limit) {
+    if (n >= limit) {
       n = Math.round(n / limit);
       return ''+n + metricPrefix[i];
     }
@@ -4977,6 +6024,23 @@ function fetchFromSvg(request, url, cb) {
 function ordinalNumber(n) {
   var s=["ᵗʰ","ˢᵗ","ⁿᵈ","ʳᵈ"], v=n%100;
   return n+(s[(v-20)%10]||s[v]||s[0]);
+}
+
+// Convert ISO 4217 code to unicode string.
+function currencyFromCode(code) {
+  return ({
+    CNY: '¥',
+    EUR: '€',
+    GBP: '₤',
+    USD: '$',
+  })[code] || code;
+}
+
+function starRating(rating) {
+  var stars = '';
+  while (stars.length < rating) { stars += '★'; }
+  while (stars.length < 5) { stars += '☆'; }
+  return stars;
 }
 
 function coveragePercentageColor(percentage) {
@@ -5015,27 +6079,52 @@ function versionColor(version) {
   }
 }
 
+// Take string versions.
+// -1 if v1 < v2, 1 if v1 > v2, 0 otherwise.
+function compareDottedVersion(v1, v2) {
+  var parts1 = /([0-9\.]+)(.*)$/.exec(v1);
+  var parts2 = /([0-9\.]+)(.*)$/.exec(v2);
+  if (parts1 != null && parts2 != null) {
+    var numbers1 = parts1[1];
+    var numbers2 = parts2[1];
+    var distinguisher1 = parts1[2];
+    var distinguisher2 = parts2[2];
+    var numlist1 = numbers1.split('.').map(function(e) { return +e; });
+    var numlist2 = numbers2.split('.').map(function(e) { return +e; });
+    var cmp = listCompare(numlist1, numlist2);
+    if (cmp !== 0) { return cmp; }
+    else { return distinguisher1 < distinguisher2? -1:
+                  distinguisher1 > distinguisher2? 1: 0; }
+  }
+  return v1 < v2? -1: v1 > v2? 1: 0;
+}
+
+// Take a list of string versions.
+// Return the latest, or undefined, if there are none.
+function latestDottedVersion(versions) {
+  var len = versions.length;
+  if (len === 0) { return; }
+  var version = versions[0];
+  for (var i = 1; i < len; i++) {
+    if (compareDottedVersion(version, versions[i]) < 0) {
+      version = versions[i];
+    }
+  }
+  return version;
+}
+
 // Given a list of versions (as strings), return the latest version.
+// Return undefined if no version could be found.
 function latestVersion(versions) {
   var version = '';
   var origVersions = versions;
   versions = versions.filter(function(version) {
     return (/^v?[0-9]/).test(version);
   });
-  semver_versions = versions.map(function(version) {
-    var matches = /^(v?[0-9]+)(\.[0-9]+)?(-.*)?$/.exec(version);
-    if (matches) {
-      version = matches[1] + (matches[2] ? matches[2] : '.0') + '.0' +
-        (matches[3] ? matches[3] : '');
-    }
-    return version;
-  });
   try {
-    version = semver.maxSatisfying(semver_versions, '');
-    version = versions[semver_versions.indexOf(version)];
+    version = semver.maxSatisfying(versions, '');
   } catch(e) {
-    versions = versions.sort();
-    version = versions[versions.length - 1];
+    version = latestDottedVersion(versions);
   }
   if (version === undefined) {
     origVersions = origVersions.sort();
@@ -5151,20 +6240,15 @@ function phpNumberedVersionData(version) {
 }
 
 function listCompare(a, b) {
-  for (var i = 0; i < a.length; i++) {
+  var alen = a.length, blen = b.length;
+  for (var i = 0; i < alen; i++) {
     if (a[i] < b[i]) {
       return -1;
     } else if (a[i] > b[i]) {
       return 1;
     }
   }
-  if (a.length < b.length) {
-    return -1;
-  } else if (a.length > b.length) {
-    return 1;
-  } else {
-    return 0;
-  }
+  return alen - blen;
 }
 
 // Return a negative value if v1 < v2,
@@ -5232,7 +6316,7 @@ function phpStableVersion(version) {
 // This searches the serverSecrets for a twitter consumer key
 // and secret, and exchanges them for a bearer token to use for all requests.
 function fetchTwitterToken() {
-  if(serverSecrets.twitter_consumer_key && serverSecrets.twitter_consumer_secret){
+  if (serverSecrets.twitter_consumer_key && serverSecrets.twitter_consumer_secret){
     // fetch a bearer token good for this app session
     // construct this bearer request with a base64 encoding of key:secret
     // docs for this are here: https://dev.twitter.com/oauth/application-only
@@ -5249,13 +6333,13 @@ function fetchTwitterToken() {
     };
     console.log('Fetching twitter bearer token...');
     request(options,function(err,res,buffer){
-      if(err){
+      if (err) {
         console.error('Error fetching twitter bearer token, error: ', err);
         return;
       }
-      try{
+      try {
         var data = JSON.parse(buffer);
-        if(data.token_type === 'bearer'){
+        if (data.token_type === 'bearer') {
           serverSecrets.twitter_bearer_token = data.access_token;
           console.log('Fetched twitter bearer token');
           return;
